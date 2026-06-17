@@ -4,6 +4,7 @@ Start UHC application services as local background processes.
 
 Infra (Postgres, Redis, Neo4j, Mongo, RabbitMQ, Storage) still runs in Docker.
 Apps run directly on the host (Python/Node) with logs in each service folder.
+Database schema and data are restored from backup.zip — deploy does not run migrations.
 
 Deploy order:
   1. agentic-backend  (pip install, celery worker, django runserver)
@@ -241,23 +242,12 @@ def wait_for_url(url: str, timeout: int = 180) -> bool:
 
 
 def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: bool) -> bool:
+    """Post-start tasks only — no DB migrations (schema/data come from backup import)."""
     ok = True
     base = [sys.executable]
     shell_env = agentic_runtime_env(env)
 
-    print("  • running Django migrations ...")
-    migrate = run(
-        [*base, "manage.py", "migrate", "--noinput"],
-        cwd=service_dir,
-        env=shell_env,
-        capture=True,
-        check=False,
-    )
-    if migrate.returncode != 0:
-        print(f"  ✗ migrate failed:\n{(migrate.stderr or '').strip()}")
-        ok = False
-    else:
-        print("  ✓ migrations complete")
+    print("  • skipping Django migrations (database restored from backup dump)")
 
     print("  • seeding builder catalog ...")
     seed = run(
@@ -298,24 +288,6 @@ def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: 
     else:
         print("  ✓ MCP config saved")
     return ok
-
-
-def run_prisma_migrate(service_dir: Path, env: dict[str, str]) -> bool:
-    print("  • running Prisma migrations ...")
-    proc_env = os.environ.copy()
-    proc_env.update(env)
-    result = run(
-        ["npx", "prisma", "migrate", "deploy"],
-        cwd=service_dir,
-        env=proc_env,
-        capture=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print(f"  ✗ prisma migrate failed:\n{(result.stderr or '').strip()}")
-        return False
-    print("  ✓ prisma migrations complete")
-    return True
 
 
 def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str]:
@@ -388,8 +360,8 @@ def deploy_claims_backend(*, recreate: bool) -> bool:
     env = prepare_service_env(app, service_dir)
     if not run_setup([npm(), "install"], cwd=service_dir, label="npm install"):
         return False
-    if not run_prisma_migrate(service_dir, env):
-        return False
+
+    print("  • skipping Prisma migrations (database restored from backup dump)")
 
     ok = start_background(
         service_dir,
@@ -462,10 +434,9 @@ def deploy_apps(*, recreate: bool = False, skip_mcp: bool = False) -> int:
         return 1
 
     print("\nDeploying application services (local processes) ...")
+    print("(no DB migrations — schema and data come from backup import)\n")
     if skip_mcp:
         print("(MCP server will be skipped)\n")
-    else:
-        print()
 
     ok = True
 
