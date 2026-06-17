@@ -292,8 +292,34 @@ def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: 
 
 def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str]:
     env = merged_env(app)
-    write_env_file(service_dir / ".env", env)
+    env_path = Path(app["env_file"])
+    if env:
+        write_env_file(service_dir / ".env", env)
+    elif env_path.is_file():
+        write_env_file(service_dir / ".env", env)
+    elif app.get("env_file_optional"):
+        local_env = service_dir / ".env"
+        if local_env.is_file():
+            print(f"  • using existing {local_env.name} in service folder")
+        else:
+            print(f"  ! optional env file missing: {env_path}")
+    else:
+        write_env_file(service_dir / ".env", env)
     return env
+
+
+def show_log_tail(service_dir: Path, log_name: str, *, lines: int = 25):
+    log_path = service_dir / log_name
+    if not log_path.is_file():
+        print(f"  ! log file not found: {log_path}")
+        return
+    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    if not tail:
+        print(f"  ! log file is empty: {log_path}")
+        return
+    print(f"  ! last lines of {log_name}:")
+    for line in tail:
+        print(f"      {line}")
 
 
 def agentic_runtime_env(env: dict[str, str]) -> dict[str, str]:
@@ -425,7 +451,20 @@ def deploy_mcp(*, recreate: bool) -> bool:
         env,
     )
     if ok and app.get("health_url"):
-        ok = wait_for_url(app["health_url"])
+        ok = wait_for_url(app["health_url"], timeout=300)
+        if not ok:
+            pf = pid_file(service_dir, "mcp")
+            pid_alive = False
+            if pf.is_file():
+                try:
+                    pid_alive = is_pid_running(int(pf.read_text(encoding="utf-8").strip()))
+                except ValueError:
+                    pass
+            show_log_tail(service_dir, "mcp-server.log")
+            if pid_alive:
+                print("  ! MCP process is running but /health did not respond — check mcp-server.log")
+            else:
+                print("  ✗ MCP process exited — see mcp-server.log above")
     return ok
 
 
