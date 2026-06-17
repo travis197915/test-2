@@ -1,0 +1,8 @@
+env-details/
+dev-env/
+.env
+env-details/.env-uhc-agentic-backend
+all_databases_backup.sql
+*.sql
+backup.zip
+env-details

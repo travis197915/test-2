@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PNG-RECRUITMENT System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #6a6fd1, #7f7fd5);
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 700px;
+            margin: 60px auto;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        p {
+            color: #555;
+        }
+        ul {
+            text-align: left;
+            margin-top: 20px;
+        }
+        .btn {
+            margin-top: 30px;
+            padding: 12px 25px;
+            background: #6a6fd1;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h3>PNG-RECRUITMENT System</h3>
+    <h1 th:text="${title}">Document Not Available</h1>
+
+    <p th:text="${message}">
+        The requested document could not be found in the system at this time.
+    </p>
+
+    <ul>
+        <li>The document may have been moved to a different location</li>
+        <li>The document link may have changed or expired</li>
+        <li>The document may be temporarily unavailable</li>
+        <li>Please verify the document reference in your records</li>
+    </ul>
+
+    <p><b>Need Help?</b><br/>
+        Please contact the PNG-RECRUITMENT support team or verify the document reference with your administrator.
+    </p>
+
+    <a href="javascript:history.back()" class="btn">Go Back</a>
+</div>
+
+</body>
+</html>
+
