@@ -162,9 +162,8 @@ APP_SERVICES = [
     },
     {
         "name": "mcp-server",
-        "env_file": os.path.join(ENV_DETAILS_ROOT, ".env-mcp-server"),
-        "env_file_optional": True,
-        "env_overrides": {},
+        # .env in dev-env/claims-tools-mcp-server/ is managed manually — deploy never writes it
+        "env_managed_locally": True,
         "health_url": "http://localhost:3000/health",
     },
     {

@@ -290,7 +290,10 @@ def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: 
     return ok
 
 
-def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str]:
+def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str] | None:
+    if app.get("env_managed_locally"):
+        return None
+
     env = merged_env(app)
     env_path = Path(app["env_file"])
     if env:
@@ -439,7 +442,12 @@ def deploy_mcp(*, recreate: bool) -> bool:
     if recreate:
         stop_service_processes(service_dir, ["mcp"])
 
-    env = prepare_service_env(app, service_dir)
+    local_env = service_dir / ".env"
+    if local_env.is_file():
+        print(f"  • using {local_env.name} (managed manually — deploy does not modify it)")
+    else:
+        print(f"  ! create {local_env} with required MCP variables before starting")
+
     if not run_setup([npm(), "install"], cwd=service_dir, label="npm install"):
         return False
 
@@ -448,7 +456,7 @@ def deploy_mcp(*, recreate: bool) -> bool:
         "mcp",
         [npm(), "run", "dev:rest"],
         "mcp-server.log",
-        env,
+        None,
     )
     if ok and app.get("health_url"):
         ok = wait_for_url(app["health_url"], timeout=300)
