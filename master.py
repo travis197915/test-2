@@ -19,6 +19,8 @@ Usage:
     python master.py --import-only --backup-zip backup.zip
     python master.py --backup-zip backup.zip --skip-mcp
     python master.py --deploy-only --skip-mcp
+    python master.py --down              # stop apps, then Docker infra
+    python master.py --status            # infra + app process status
 """
 
 import argparse
@@ -48,7 +50,7 @@ def main():
     parser.add_argument("--recreate", action="store_true",
                         help="recreate infra and app containers")
     parser.add_argument("--down", action="store_true",
-                        help="stop & remove app and infra containers")
+                        help="stop local app processes, then stop & remove infra containers")
     parser.add_argument("--status", action="store_true",
                         help="show running containers")
     parser.add_argument("--skip-import", action="store_true",

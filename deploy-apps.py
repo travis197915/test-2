@@ -13,12 +13,17 @@ Deploy order:
   4. claims-frontend  (node serve-dist.mjs)
   5. mcp-server       (npm install, npm run dev:rest)
 
+Each service stops any previously tracked process (from .deploy-*.pid) before starting.
+
 Usage:
     python deploy-apps.py
-    python deploy-apps.py --recreate
+    python deploy-apps.py --recreate   # same as default (stop + restart apps)
     python deploy-apps.py --skip-mcp
-    python deploy-apps.py --down
-    python deploy-apps.py --status
+    python deploy-apps.py --down       # stop all local app processes only
+    python deploy-apps.py --status     # show running PIDs
+
+Stop everything (apps + Docker infra):
+    python master.py --down
 """
 
 from __future__ import annotations
@@ -342,8 +347,7 @@ def deploy_agentic(*, recreate: bool, skip_mcp: bool) -> bool:
         return False
 
     process_names = ["celery", "django"]
-    if recreate:
-        stop_service_processes(service_dir, process_names)
+    stop_service_processes(service_dir, process_names)
 
     env = prepare_service_env(app, service_dir)
     if not run_setup(
@@ -383,8 +387,7 @@ def deploy_claims_backend(*, recreate: bool) -> bool:
         print("  ✗ folder not found: dev-env/claims-backend")
         return False
 
-    if recreate:
-        stop_service_processes(service_dir, ["nodebackend"])
+    stop_service_processes(service_dir, ["nodebackend"])
 
     env = prepare_service_env(app, service_dir)
     if not run_setup([npm(), "install"], cwd=service_dir, label="npm install"):
@@ -411,8 +414,7 @@ def deploy_node_static(app_name: str, *, script: str, process_name: str, log_nam
         print(f"  ✗ folder not found for {app_name} under dev-env/")
         return False
 
-    if recreate:
-        stop_service_processes(service_dir, [process_name])
+    stop_service_processes(service_dir, [process_name])
 
     env = prepare_service_env(app, service_dir)
     script_path = service_dir / script
@@ -439,8 +441,7 @@ def deploy_mcp(*, recreate: bool) -> bool:
         print("  ✗ folder not found: dev-env/claims-tools-mcp-server")
         return False
 
-    if recreate:
-        stop_service_processes(service_dir, ["mcp"])
+    stop_service_processes(service_dir, ["mcp"])
 
     local_env = service_dir / ".env"
     if local_env.is_file():
@@ -597,7 +598,7 @@ def main():
                         help="skip MCP server")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--recreate", action="store_true",
-                       help="stop and restart application processes")
+                       help="stop and restart application processes (default behavior)")
     group.add_argument("--down", action="store_true",
                        help="stop local application processes")
     group.add_argument("--status", action="store_true",
