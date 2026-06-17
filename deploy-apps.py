@@ -8,8 +8,8 @@ Apps run directly on the host (Python/Node) with logs in each service folder.
 Deploy order:
   1. agentic-backend  (pip install, celery worker, django runserver)
   2. claims-backend   (npm install, npm run dev)
-  3. audit-dashboard  (node serve-dist.msj)
-  4. claims-frontend  (node serve-dist.msj)
+  3. audit-dashboard  (node serve-dist.mjs)
+  4. claims-frontend  (node serve-dist.mjs)
   5. mcp-server       (npm install, npm run dev:rest)
 
 Usage:
@@ -243,9 +243,7 @@ def wait_for_url(url: str, timeout: int = 180) -> bool:
 def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: bool) -> bool:
     ok = True
     base = [sys.executable]
-    shell_env = os.environ.copy()
-    shell_env.update(env)
-    shell_env["PYTHONPATH"] = "."
+    shell_env = agentic_runtime_env(env)
 
     print("  • running Django migrations ...")
     migrate = run(
@@ -326,6 +324,15 @@ def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str]:
     return env
 
 
+def agentic_runtime_env(env: dict[str, str]) -> dict[str, str]:
+    """Env vars required for Django/Celery on Windows and Unix."""
+    runtime = os.environ.copy()
+    runtime.update(env)
+    runtime["PYTHONPATH"] = "."
+    runtime["DJANGO_SETTINGS_MODULE"] = "sop_backend.settings"
+    return runtime
+
+
 def deploy_agentic(*, recreate: bool, skip_mcp: bool) -> bool:
     app = next(a for a in APP_SERVICES if a["name"] == "agentic-backend")
     service_dir = resolve_service_dir("agentic-backend")
@@ -348,18 +355,19 @@ def deploy_agentic(*, recreate: bool, skip_mcp: bool) -> bool:
     if not run_agentic_post_start(service_dir, env, skip_mcp=skip_mcp):
         return False
 
+    runtime_env = agentic_runtime_env(env)
     celery_cmd = [
         sys.executable, "-m", "celery", "-A", "sop_backend", "worker",
         "-Q", "job_queue,celery",
         "--concurrency=4", "-l", "INFO",
     ]
-    ok = start_background(service_dir, "celery", celery_cmd, "celery.log", env)
+    ok = start_background(service_dir, "celery", celery_cmd, "celery.log", runtime_env)
     ok = start_background(
         service_dir,
         "django",
         [sys.executable, "manage.py", "runserver", "0.0.0.0:8000"],
         "agentic-backend.log",
-        env,
+        runtime_env,
     ) and ok
 
     if ok and app.get("health_url"):
@@ -470,7 +478,7 @@ def deploy_apps(*, recreate: bool = False, skip_mcp: bool = False) -> int:
     print("\n[audit-dashboard]")
     ok = deploy_node_static(
         "audit-dashboard",
-        script="serve-dist.msj",
+        script="serve-dist.mjs",
         process_name="audit",
         log_name="audit-dashboard.log",
         recreate=recreate,
@@ -479,7 +487,7 @@ def deploy_apps(*, recreate: bool = False, skip_mcp: bool = False) -> int:
     print("\n[claims-frontend]")
     ok = deploy_node_static(
         "claims-frontend",
-        script="serve-dist.msj",
+        script="serve-dist.mjs",
         process_name="frontend",
         log_name="claims-frontend.log",
         recreate=recreate,

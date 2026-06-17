@@ -1,9 +1,0 @@
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/FileApiApplication.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/App.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/config/StorageAuthProperties.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/service/StorageService.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/security/AuthFilter.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/controller/StorageController.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/controller/CustomErrorController.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/controller/UiController.java
-/Users/toystack_ai_engineer/Toystack/DOPAMAS/toystacks3/src/main/java/com/example/files/exception/GlobalExceptionHandler.java

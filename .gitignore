@@ -1,8 +1,10 @@
 env-details/
 dev-env/
+storage-account/
 .env
-env-details/.env-uhc-agentic-backend
-all_databases_backup.sql
-*.sql
 backup.zip
-env-details
+*.sql
+all_databases_backup.sql
+__pycache__/
+*.pyc
+.DS_Store

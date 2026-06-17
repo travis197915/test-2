@@ -25,7 +25,17 @@ import time
 import zipfile
 from pathlib import Path
 
-from stack_config import mongo_creds, neo4j_creds, pg_creds, service
+from stack_config import (
+    MONGO_APP_DB,
+    PG_AGENTIC_DB,
+    PG_CLAIMS_SCHEMA,
+    PG_CLUSTER_DATABASES,
+    PG_DEFAULT_DB,
+    mongo_creds,
+    neo4j_creds,
+    pg_creds,
+    service,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_EXTRACT_DIR = SCRIPT_DIR / ".backup-extract"
@@ -265,32 +275,11 @@ def reset_postgres_database() -> bool:
 
 
 def prepare_cluster_import() -> bool:
-    """Drop databases present in cluster dumps so import can recreate them."""
-    user, password, target_db = pg_creds()
-    name = service("postgres")["name"]
-    print("  • preparing cluster import (drop/recreate databases from dump)")
-
-    extra_dbs = ["agentic_flow_v2db", "test_postgres"]
-    for db in extra_dbs:
+    """Drop databases from cluster dumps so import can recreate them."""
+    print("  • preparing cluster import (dropping databases — dump will recreate them)")
+    for db in PG_CLUSTER_DATABASES:
         if not drop_postgres_database(db):
             return False
-
-    if not reset_postgres_database():
-        return False
-
-    # Ensure postgres superuser can create databases referenced in the dump.
-    grant = run(
-        [
-            "docker", "exec", name,
-            "env", f"PGPASSWORD={password}",
-            "psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", "template1", "-c",
-            f"ALTER DATABASE {target_db} OWNER TO {user};",
-        ],
-        capture=True,
-        check=False,
-    )
-    if grant.returncode != 0:
-        print(f"  ! database owner warning:\n{grant.stderr.strip()}")
     return True
 
 
@@ -326,9 +315,9 @@ def import_postgres(sql_file: Path) -> bool:
     if result.returncode == 0:
         print("  ✓ postgres import complete")
         if cluster:
-            print("  • databases restored: postgres, agentic_flow_v2db, test_postgres")
-            print("  • claims backend schema: claims_corebackend.app_user")
-            print("  • agentic backend database: postgres (public + agent_tools)")
+            print(f"  • databases restored: {', '.join(PG_CLUSTER_DATABASES)}")
+            print(f"  • claims backend: {PG_DEFAULT_DB} (schema {PG_CLAIMS_SCHEMA})")
+            print(f"  • agentic backend database: {PG_AGENTIC_DB}")
         return True
 
     err = (result.stderr or "").strip()
@@ -528,11 +517,12 @@ def run_import(backup_zip: Path, extract_dir: Path) -> int:
 
     print("\n" + "─" * 60)
     if ok:
-        user, _, db = pg_creds()
+        user, _, _ = pg_creds()
         m_user, _, m_db = mongo_creds()
         n_user, _, n_db = neo4j_creds()
         print("Backup import finished successfully.\n")
-        print(f"  Postgres  localhost:5432  user={user}  db={db}")
+        print(f"  Postgres  localhost:5432  user={user}")
+        print(f"             agentic db={PG_AGENTIC_DB}  claims db={PG_DEFAULT_DB} (schema {PG_CLAIMS_SCHEMA})")
         print(f"  MongoDB   localhost:27017 user={m_user}  db={m_db}")
         print(f"  Neo4j     bolt://localhost:7687  user={n_user}  db={n_db}")
     else:

@@ -12,6 +12,13 @@ STORAGE_SECRET = "9xK79lGHdfgdfgHt"
 STORAGE_PORT = 8080
 STORAGE_URL = f"http://localhost:{STORAGE_PORT}/storage/"
 
+# Application database names (infra starts empty; backup import loads data).
+PG_DEFAULT_DB = "postgres"              # claims backend database
+PG_AGENTIC_DB = "agentic_flow_v2db"       # agentic backend database
+PG_CLAIMS_SCHEMA = "claims_corebackend"   # claims backend schema inside postgres
+MONGO_APP_DB = "sop_ingestion_v2"         # agentic mongo database
+PG_CLUSTER_DATABASES = [PG_DEFAULT_DB, PG_AGENTIC_DB, "test_postgres"]
+
 SERVICES = [
     {
         "name": "postgres",
@@ -20,7 +27,7 @@ SERVICES = [
         "env": {
             "POSTGRES_USER": "postgres",
             "POSTGRES_PASSWORD": "s1Hd6Tg1Ksdfs",
-            "POSTGRES_DB": "postgres",
+            "POSTGRES_DB": PG_DEFAULT_DB,
         },
         "host_path": os.path.join(DATA_ROOT, "postgres"),
         "volume": "/var/lib/postgresql/data",
@@ -57,7 +64,7 @@ SERVICES = [
         "env": {
             "MONGO_INITDB_ROOT_USERNAME": "admin",
             "MONGO_INITDB_ROOT_PASSWORD": "s1Hd6lsd34jdkkljsdnflssd99ef8dfsdfc2Gl1Uu",
-            "MONGO_INITDB_DATABASE": "sop_ingestion",
+            "MONGO_INITDB_DATABASE": MONGO_APP_DB,
         },
         "host_path": os.path.join(DATA_ROOT, "mongo"),
         "volume": "/data/db",
@@ -108,7 +115,7 @@ def mongo_creds():
     return (
         env["MONGO_INITDB_ROOT_USERNAME"],
         env["MONGO_INITDB_ROOT_PASSWORD"],
-        env["MONGO_INITDB_DATABASE"],
+        MONGO_APP_DB,
     )
 
 
@@ -147,7 +154,10 @@ APP_SERVICES = [
     {
         "name": "agentic-backend",
         "env_file": os.path.join(ENV_DETAILS_ROOT, ".env-uhc-agentic-backend"),
-        "env_overrides": {},
+        "env_overrides": {
+            "PG_DATABASE": PG_AGENTIC_DB,
+            "MONGO_DATABASE": MONGO_APP_DB,
+        },
         "health_url": "http://localhost:8000/api/ingest/health/",
     },
     {
@@ -188,6 +198,9 @@ def app_service(name):
 
 
 def claims_database_url():
-    user, password, database = pg_creds()
-    return f"postgresql://{user}:{password}@localhost:5432/{database}?schema=claims_corebackend"
+    user, password, _ = pg_creds()
+    return (
+        f"postgresql://{user}:{password}@localhost:5432/"
+        f"{PG_DEFAULT_DB}?schema={PG_CLAIMS_SCHEMA}"
+    )
 
