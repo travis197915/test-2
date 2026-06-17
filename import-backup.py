@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -198,6 +199,10 @@ def is_cluster_dump(sql_text: str) -> bool:
 def sanitize_postgres_sql(sql_text: str, *, cluster: bool) -> str:
     """Make dumps from newer Postgres versions import cleanly into PG 16."""
     cleaned: list[str] = []
+    create_default_db = re.compile(
+        rf"^CREATE DATABASE\s+{re.escape(PG_DEFAULT_DB)}\b",
+        re.IGNORECASE,
+    )
     for line in sql_text.splitlines():
         stripped = line.strip()
         if stripped.startswith("\\restrict") or stripped.startswith("\\unrestrict"):
@@ -212,6 +217,9 @@ def sanitize_postgres_sql(sql_text: str, *, cluster: bool) -> str:
             stripped.startswith("CREATE ROLE")
             or stripped.startswith("ALTER ROLE")
         ):
+            continue
+        # postgres is recreated empty before import; skip CREATE DATABASE postgres.
+        if cluster and create_default_db.match(stripped):
             continue
         cleaned.append(line)
     return "\n".join(cleaned) + "\n"
@@ -275,12 +283,23 @@ def reset_postgres_database() -> bool:
 
 
 def prepare_cluster_import() -> bool:
-    """Drop databases from cluster dumps so import can recreate them."""
-    print("  • preparing cluster import (dropping databases — dump will recreate them)")
+    """Prepare for cluster dump import.
+
+    - Drop satellite databases (agentic_flow_v2db, test_postgres, …) so the dump
+      can CREATE DATABASE them.
+    - Reset the default postgres DB to an empty shell so \\connect postgres works
+      and CREATE DATABASE postgres in the dump is skipped (already exists).
+    """
+    print("  • preparing cluster import")
     for db in PG_CLUSTER_DATABASES:
+        if db == PG_DEFAULT_DB:
+            continue
+        print(f"    • dropping '{db}'")
         if not drop_postgres_database(db):
             return False
-    return True
+
+    print(f"    • resetting '{PG_DEFAULT_DB}' (empty shell for \\connect)")
+    return reset_postgres_database()
 
 
 def import_postgres(sql_file: Path) -> bool:
