@@ -19,6 +19,13 @@ PG_CLAIMS_SCHEMA = "claims_corebackend"   # claims backend schema inside postgre
 MONGO_APP_DB = "sop_ingestion_v2"         # agentic mongo database
 PG_CLUSTER_DATABASES = [PG_DEFAULT_DB, PG_AGENTIC_DB, "test_postgres"]
 
+# master.py --new | --existing | --merge
+DATA_MODES = ("new", "existing", "merge")
+
+
+def stack_volume_name(service_name: str) -> str:
+    return f"{service_name}-data"
+
 SERVICES = [
     {
         "name": "postgres",

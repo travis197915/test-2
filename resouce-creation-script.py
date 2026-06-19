@@ -7,7 +7,9 @@ installed and the daemon is running.
 
 Usage:
     python setup_stack.py            # create + start everything
-    python setup_stack.py --recreate # remove & recreate containers (data dirs kept)
+    python setup_stack.py --recreate              # recreate containers (keep volumes)
+    python setup_stack.py --recreate --volume-mode new      # wipe volumes, fresh start
+    python setup_stack.py --recreate --volume-mode existing # keep volumes (default)
     python setup_stack.py --down     # stop & remove containers (data dirs kept)
     python setup_stack.py --status   # show what's running
 
@@ -17,10 +19,20 @@ Everything you need to edit (passwords + volume paths) is in stack_config.py.
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import sys
 
-from stack_config import DATA_ROOT, NETWORK_NAME, SERVICES, STORAGE_PORT, STORAGE_URL, USE_NAMED_VOLUMES
+from stack_config import (
+    DATA_MODES,
+    DATA_ROOT,
+    NETWORK_NAME,
+    SERVICES,
+    STORAGE_PORT,
+    STORAGE_URL,
+    USE_NAMED_VOLUMES,
+    stack_volume_name,
+)
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -131,7 +143,7 @@ def add_volume_mount(cmd, service):
     Returns False if a host directory could not be prepared.
     """
     if USE_NAMED_VOLUMES:
-        cmd += ["-v", f"{service['name']}-data:{service['volume']}"]
+        cmd += ["-v", f"{stack_volume_name(service['name'])}:{service['volume']}"]
         return True
 
     hp = host_path(service)
@@ -264,9 +276,35 @@ def create_service(service, recreate):
     return False
 
 
-def cmd_up(recreate):
-    print(f"\nData mode : {'Docker named volumes' if USE_NAMED_VOLUMES else DATA_ROOT}")
-    print(f"Platform  : {platform.system()}\n")
+def remove_all_data_volumes():
+    """Delete every stack data volume or bind-mount folder."""
+    print("\nRemoving all stack data volumes ...")
+    for svc in SERVICES:
+        if USE_NAMED_VOLUMES:
+            vol = stack_volume_name(svc["name"])
+            print(f"  • removing volume '{vol}' ...")
+            run(["docker", "volume", "rm", "-f", vol], check=False)
+        else:
+            hp = host_path(svc)
+            if os.path.isdir(hp):
+                print(f"  • removing data dir '{hp}' ...")
+                shutil.rmtree(hp, ignore_errors=True)
+
+
+def cmd_up(recreate, volume_mode="existing"):
+    storage = "Docker named volumes" if USE_NAMED_VOLUMES else DATA_ROOT
+    print(f"\nData mode   : {storage}")
+    print(f"Volume mode : {volume_mode}")
+    print(f"Platform    : {platform.system()}\n")
+
+    if volume_mode == "new":
+        cmd_down()
+        remove_all_data_volumes()
+        recreate = True
+    elif volume_mode not in DATA_MODES:
+        print(f"ERROR: unknown volume mode '{volume_mode}' (use: {', '.join(DATA_MODES)})")
+        return 1
+
     ensure_network()
     ok = True
     for svc in SERVICES:
@@ -320,6 +358,12 @@ def main():
     g.add_argument("--down", action="store_true",
                    help="stop & remove containers (data kept)")
     g.add_argument("--status", action="store_true", help="show running containers")
+    p.add_argument(
+        "--volume-mode",
+        choices=DATA_MODES,
+        default="existing",
+        help="new=wipe volumes then create; existing=keep volumes; merge=keep volumes",
+    )
     args = p.parse_args()
 
     if not docker_ready():
@@ -330,7 +374,7 @@ def main():
     elif args.status:
         cmd_status()
     else:
-        sys.exit(cmd_up(recreate=args.recreate))
+        sys.exit(cmd_up(recreate=args.recreate, volume_mode=args.volume_mode))
 
 
 

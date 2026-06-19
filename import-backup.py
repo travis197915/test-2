@@ -11,7 +11,9 @@ contain:
 
 Usage:
     python import-backup.py --backup-zip /path/to/backup.zip
-    python import-backup.py --backup-zip backup.zip --extract-dir ./.backup-extract
+    python import-backup.py --backup-zip backup.zip --import-mode existing
+    python import-backup.py --backup-zip backup.zip --import-mode new
+    python import-backup.py --backup-zip backup.zip --import-mode merge
 """
 
 
@@ -27,6 +29,7 @@ import zipfile
 from pathlib import Path
 
 from stack_config import (
+    DATA_MODES,
     MONGO_APP_DB,
     PG_AGENTIC_DB,
     PG_CLAIMS_SCHEMA,
@@ -153,27 +156,35 @@ def unzip_backup(zip_path: Path, extract_dir: Path) -> Path:
     return extract_dir
 
 
+def pick_newest(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    return max(paths, key=lambda p: p.stat().st_mtime)
+
+
 def find_sql_file(root: Path) -> Path | None:
     matches = [
         p for p in root.rglob("*.sql")
         if p.is_file() and not is_junk_path(p)
     ]
-    if not matches:
-        return None
-    return max(matches, key=lambda p: p.stat().st_size)
+    return pick_newest(matches)
 
 
 def find_mongo_backup_dir(root: Path) -> Path | None:
+    candidates: list[Path] = []
     for prelude in root.rglob("prelude.json"):
         if prelude.is_file() and not is_junk_path(prelude):
-            return prelude.parent
+            candidates.append(prelude.parent)
+
+    if candidates:
+        return pick_newest(candidates)
 
     for path in sorted(root.rglob("*")):
         if not path.is_dir() or is_junk_path(path):
             continue
         if any(path.glob("*.bson")) and any(p.is_dir() for p in path.iterdir()):
-            return path
-    return None
+            candidates.append(path)
+    return pick_newest(candidates)
 
 
 def find_neo4j_dump(root: Path) -> Path | None:
@@ -181,7 +192,7 @@ def find_neo4j_dump(root: Path) -> Path | None:
         p for p in root.rglob("neo4j.dump")
         if p.is_file() and not is_junk_path(p)
     ]
-    return matches[0] if matches else None
+    return pick_newest(matches)
 
 
 def discover_artifacts(root: Path):
@@ -196,9 +207,10 @@ def is_cluster_dump(sql_text: str) -> bool:
     return "PostgreSQL database cluster dump" in head
 
 
-def sanitize_postgres_sql(sql_text: str, *, cluster: bool) -> str:
+def sanitize_postgres_sql(sql_text: str, *, cluster: bool, merge: bool = False) -> str:
     """Make dumps from newer Postgres versions import cleanly into PG 16."""
     cleaned: list[str] = []
+    create_db = re.compile(r"^CREATE DATABASE\s+", re.IGNORECASE)
     create_default_db = re.compile(
         rf"^CREATE DATABASE\s+{re.escape(PG_DEFAULT_DB)}\b",
         re.IGNORECASE,
@@ -218,8 +230,10 @@ def sanitize_postgres_sql(sql_text: str, *, cluster: bool) -> str:
             or stripped.startswith("ALTER ROLE")
         ):
             continue
+        if cluster and merge and create_db.match(stripped):
+            continue
         # postgres is recreated empty before import; skip CREATE DATABASE postgres.
-        if cluster and create_default_db.match(stripped):
+        if cluster and not merge and create_default_db.match(stripped):
             continue
         cleaned.append(line)
     return "\n".join(cleaned) + "\n"
@@ -302,23 +316,29 @@ def prepare_cluster_import() -> bool:
     return reset_postgres_database()
 
 
-def import_postgres(sql_file: Path) -> bool:
+def import_postgres(sql_file: Path, *, import_mode: str) -> bool:
     user, password, database = pg_creds()
     name = service("postgres")["name"]
     sql_text = sql_file.read_text(encoding="utf-8", errors="replace")
     cluster = is_cluster_dump(sql_text)
+    merge = import_mode == "merge"
+    replace = import_mode in ("new", "existing")
 
     if cluster:
-        print(f"\n[postgres] importing cluster dump {sql_file.name}")
-        if not prepare_cluster_import():
-            return False
-        sql_text = sanitize_postgres_sql(sql_text, cluster=True)
+        print(f"\n[postgres] importing cluster dump {sql_file.name} ({import_mode} mode)")
+        if replace:
+            if not prepare_cluster_import():
+                return False
+            sql_text = sanitize_postgres_sql(sql_text, cluster=True, merge=False)
+        else:
+            print("  • merge mode — keeping existing databases, applying dump updates")
+            sql_text = sanitize_postgres_sql(sql_text, cluster=True, merge=True)
         psql_db = "template1"
     else:
-        print(f"\n[postgres] importing {sql_file.name} → database '{database}'")
-        if not reset_postgres_database():
+        print(f"\n[postgres] importing {sql_file.name} → database '{database}' ({import_mode} mode)")
+        if replace and not reset_postgres_database():
             return False
-        sql_text = sanitize_postgres_sql(sql_text, cluster=False)
+        sql_text = sanitize_postgres_sql(sql_text, cluster=False, merge=merge)
         psql_db = database
 
     result = run(
@@ -342,15 +362,26 @@ def import_postgres(sql_file: Path) -> bool:
     err = (result.stderr or "").strip()
     print(f"  ✗ postgres import failed:\n{err}")
     if cluster and "already exists" in err.lower():
-        print("  hint: re-run with containers recreated (master.py --recreate)")
+        if merge:
+            print("  hint: postgres merge failed — try --existing for full replace or --new for fresh volumes")
+        else:
+            print("  hint: re-run with --new or master.py --existing")
     return False
 
 
-def import_mongo(mongo_dir: Path) -> bool:
+def import_mongo(mongo_dir: Path, *, import_mode: str) -> bool:
     user, password, expected_db = mongo_creds()
     name = service("mongo")["name"]
     container_path = "/tmp/mongorestore"
-    print(f"\n[mongo] importing {mongo_dir.name} → authdb=admin (app db: {expected_db})")
+    drop = import_mode in ("new", "existing")
+    print(
+        f"\n[mongo] importing {mongo_dir.name} → authdb=admin "
+        f"(app db: {expected_db}, {import_mode} mode)"
+    )
+    if drop:
+        print("  • replace mode — dropping collections before restore")
+    else:
+        print("  • merge mode — upserting into existing collections")
 
     run(["docker", "exec", name, "rm", "-rf", container_path], check=False)
     cp = run(
@@ -364,16 +395,19 @@ def import_mongo(mongo_dir: Path) -> bool:
 
     # docker cp creates container_path as a copy of the source folder when the
     # destination does not already exist.
+    restore_cmd = [
+        "docker", "exec", name,
+        "mongorestore",
+        "--username", user,
+        "--password", password,
+        "--authenticationDatabase", "admin",
+    ]
+    if drop:
+        restore_cmd.append("--drop")
+    restore_cmd.append(container_path)
+
     result = run(
-        [
-            "docker", "exec", name,
-            "mongorestore",
-            "--username", user,
-            "--password", password,
-            "--authenticationDatabase", "admin",
-            "--drop",
-            container_path,
-        ],
+        restore_cmd,
         capture=True,
         check=False,
     )
@@ -387,13 +421,15 @@ def import_mongo(mongo_dir: Path) -> bool:
     return False
 
 
-def import_neo4j(dump_file: Path) -> bool:
+def import_neo4j(dump_file: Path, *, import_mode: str) -> bool:
     user, password, database = neo4j_creds()
     neo4j_svc = service("neo4j")
     name = neo4j_svc["name"]
     loader_name = f"{name}-loader-tmp"
     container_dump_path = "/import/neo4j.dump"
-    print(f"\n[neo4j] importing {dump_file.name} → database '{database}'")
+    print(f"\n[neo4j] importing {dump_file.name} → database '{database}' ({import_mode} mode)")
+    if import_mode == "merge":
+        print("  ! neo4j dump restore always replaces the target database (no partial merge)")
 
     run(["docker", "stop", name], capture=True, check=False)
     run(["docker", "rm", "-f", loader_name], capture=True, check=False)
@@ -491,7 +527,13 @@ def ensure_containers():
     return True
 
 
-def run_import(backup_zip: Path, extract_dir: Path) -> int:
+def run_import(backup_zip: Path, extract_dir: Path, *, import_mode: str = "existing") -> int:
+    if import_mode not in DATA_MODES:
+        print(f"ERROR: unknown import mode '{import_mode}' (use: {', '.join(DATA_MODES)})")
+        return 1
+
+    print(f"\nImport mode : {import_mode}")
+
     if not ensure_containers():
         return 1
 
@@ -517,19 +559,19 @@ def run_import(backup_zip: Path, extract_dir: Path) -> int:
 
     ok = True
     if sql_file:
-        ok = import_postgres(sql_file) and ok
+        ok = import_postgres(sql_file, import_mode=import_mode) and ok
     else:
         print("\n[postgres] skipped — no .sql file found")
         ok = False
 
     if mongo_dir:
-        ok = import_mongo(mongo_dir) and ok
+        ok = import_mongo(mongo_dir, import_mode=import_mode) and ok
     else:
         print("\n[mongo] skipped — no mongodump folder found")
         ok = False
 
     if neo4j_dump:
-        ok = import_neo4j(neo4j_dump) and ok
+        ok = import_neo4j(neo4j_dump, import_mode=import_mode) and ok
     else:
         print("\n[neo4j] skipped — no neo4j.dump found")
         ok = False
@@ -560,9 +602,19 @@ def main():
         "--extract-dir", default=str(DEFAULT_EXTRACT_DIR),
         help=f"Where to extract the archive (default: {DEFAULT_EXTRACT_DIR})",
     )
+    parser.add_argument(
+        "--import-mode",
+        choices=DATA_MODES,
+        default="existing",
+        help="new/existing=full replace from backup; merge=upsert into existing data",
+    )
     args = parser.parse_args()
 
-    return run_import(Path(args.backup_zip).expanduser(), Path(args.extract_dir))
+    return run_import(
+        Path(args.backup_zip).expanduser(),
+        Path(args.extract_dir),
+        import_mode=args.import_mode,
+    )
 
 
 if __name__ == "__main__":

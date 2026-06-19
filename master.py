@@ -3,7 +3,14 @@
 Master orchestrator: infrastructure, backup import, and application deployment.
 
 Full flow:
-    python master.py --backup-zip backup.zip --recreate
+    python master.py --backup-zip backup.zip --existing
+    python master.py --backup-zip backup.zip --new
+    python master.py --backup-zip backup.zip --merge
+
+Data modes:
+    --new       Delete all Docker volumes, create fresh containers, full import
+    --existing  Keep volumes, recreate containers, full replace import (default)
+    --merge     Keep volumes, recreate containers, merge/upsert import
 
 Steps:
     1. resouce-creation-script.py  — Postgres, Redis, Neo4j, Mongo, RabbitMQ, Storage
@@ -11,12 +18,14 @@ Steps:
     3. deploy-apps.py              — agentic → mcp → claims-backend → frontends
 
 Usage:
-    python master.py --backup-zip backup.zip
-    python master.py --backup-zip backup.zip --recreate
+    python master.py --backup-zip backup.zip --existing
+    python master.py --backup-zip backup.zip --new
+    python master.py --backup-zip backup.zip --merge
+    python master.py --backup-zip backup.zip --recreate   # alias for --existing
     python master.py --backup-zip backup.zip --skip-import
     python master.py --backup-zip backup.zip --skip-deploy
     python master.py --deploy-only
-    python master.py --import-only --backup-zip backup.zip
+    python master.py --import-only --backup-zip backup.zip --merge
     python master.py --backup-zip backup.zip --skip-mcp
     python master.py --deploy-only --skip-mcp
     python master.py --down              # stop apps, then Docker infra
@@ -39,6 +48,11 @@ def run_script(script: Path, args: list[str]) -> int:
     return result.returncode
 
 
+def volume_mode_for(data_mode: str) -> str:
+    """Infra volume handling: only --new wipes volumes."""
+    return "new" if data_mode == "new" else "existing"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Start infra, import backup, and deploy UHC applications.",
@@ -47,8 +61,25 @@ def main():
         "--backup-zip",
         help="Path to backup.zip (required for import unless --skip-import)",
     )
-    parser.add_argument("--recreate", action="store_true",
-                        help="recreate infra and app containers")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--new", dest="data_mode", action="store_const", const="new",
+        help="wipe all data volumes, create fresh containers, full import",
+    )
+    mode_group.add_argument(
+        "--merge", dest="data_mode", action="store_const", const="merge",
+        help="keep volumes, merge/upsert backup data into existing databases",
+    )
+    mode_group.add_argument(
+        "--existing", dest="data_mode", action="store_const", const="existing",
+        help="keep volumes, full replace import from backup (default)",
+    )
+    mode_group.add_argument(
+        "--recreate", dest="data_mode", action="store_const", const="existing",
+        help="alias for --existing (backward compatible)",
+    )
+    parser.set_defaults(data_mode="existing")
+
     parser.add_argument("--down", action="store_true",
                         help="stop local app processes, then stop & remove infra containers")
     parser.add_argument("--status", action="store_true",
@@ -76,15 +107,17 @@ def main():
         return run_script(DEPLOY_SCRIPT, ["--status"])
 
     if args.deploy_only:
-        deploy_args = []
-        if args.recreate:
-            deploy_args.append("--recreate")
+        deploy_args = ["--recreate"]
         if args.skip_mcp:
             deploy_args.append("--skip-mcp")
         return run_script(DEPLOY_SCRIPT, deploy_args)
 
     if not args.import_only:
-        stack_args = ["--recreate"] if args.recreate else []
+        stack_args = [
+            "--recreate",
+            f"--volume-mode={volume_mode_for(args.data_mode)}",
+        ]
+        print(f"\nData mode: {args.data_mode}\n")
         code = run_script(STACK_SCRIPT, stack_args)
         if code != 0:
             return code
@@ -97,7 +130,11 @@ def main():
         if not backup_zip.is_file():
             print(f"ERROR: backup zip not found: {backup_zip}")
             return 1
-        code = run_script(IMPORT_SCRIPT, ["--backup-zip", str(backup_zip)])
+        import_args = [
+            "--backup-zip", str(backup_zip),
+            f"--import-mode={args.data_mode}",
+        ]
+        code = run_script(IMPORT_SCRIPT, import_args)
         if code != 0:
             return code
     elif not args.import_only:
@@ -111,15 +148,16 @@ def main():
         if not backup_zip.is_file():
             print(f"ERROR: backup zip not found: {backup_zip}")
             return 1
-        return run_script(IMPORT_SCRIPT, ["--backup-zip", str(backup_zip)])
+        return run_script(IMPORT_SCRIPT, [
+            "--backup-zip", str(backup_zip),
+            f"--import-mode={args.data_mode}",
+        ])
 
     if args.skip_deploy:
         print("\nSkipping application deployment (--skip-deploy).")
         return 0
 
-    deploy_args = []
-    if args.recreate:
-        deploy_args.append("--recreate")
+    deploy_args = ["--recreate"]
     if args.skip_mcp:
         deploy_args.append("--skip-mcp")
     return run_script(DEPLOY_SCRIPT, deploy_args)
