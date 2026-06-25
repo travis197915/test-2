@@ -13,10 +13,9 @@ Usage:
     python import-backup.py --backup-zip /path/to/backup.zip
     python import-backup.py --backup-zip backup.zip --import-mode existing
     python import-backup.py --backup-zip backup.zip --import-mode new
-    python import-backup.py --backup-zip backup.zip --import-mode merge
+    python import-backup.py --backup-zip backup.zip --targets postgres,mongo
+    python import-backup.py --backup-zip backup.zip --targets all --import-mode merge
 """
-
-
 
 import argparse
 import os
@@ -28,16 +27,16 @@ import time
 import zipfile
 from pathlib import Path
 
-from stack_config import (
-    DATA_MODES,
-    MONGO_APP_DB,
-    PG_AGENTIC_DB,
-    PG_CLAIMS_SCHEMA,
-    PG_CLUSTER_DATABASES,
-    PG_DEFAULT_DB,
+import config
+from config import (
+    pg_agentic_db,
+    pg_claims_schema,
+    pg_cluster_databases,
+    pg_default_db,
+    mongo_app_db,
+    pg_creds,
     mongo_creds,
     neo4j_creds,
-    pg_creds,
     service,
 )
 
@@ -212,7 +211,7 @@ def sanitize_postgres_sql(sql_text: str, *, cluster: bool, merge: bool = False) 
     cleaned: list[str] = []
     create_db = re.compile(r"^CREATE DATABASE\s+", re.IGNORECASE)
     create_default_db = re.compile(
-        rf"^CREATE DATABASE\s+{re.escape(PG_DEFAULT_DB)}\b",
+        rf"^CREATE DATABASE\s+{re.escape(pg_default_db())}\b",
         re.IGNORECASE,
     )
     for line in sql_text.splitlines():
@@ -305,14 +304,14 @@ def prepare_cluster_import() -> bool:
       and CREATE DATABASE postgres in the dump is skipped (already exists).
     """
     print("  • preparing cluster import")
-    for db in PG_CLUSTER_DATABASES:
-        if db == PG_DEFAULT_DB:
+    for db in pg_cluster_databases():
+        if db == pg_default_db():
             continue
         print(f"    • dropping '{db}'")
         if not drop_postgres_database(db):
             return False
 
-    print(f"    • resetting '{PG_DEFAULT_DB}' (empty shell for \\connect)")
+    print(f"    • resetting '{pg_default_db()}' (empty shell for \\connect)")
     return reset_postgres_database()
 
 
@@ -354,9 +353,9 @@ def import_postgres(sql_file: Path, *, import_mode: str) -> bool:
     if result.returncode == 0:
         print("  ✓ postgres import complete")
         if cluster:
-            print(f"  • databases restored: {', '.join(PG_CLUSTER_DATABASES)}")
-            print(f"  • claims backend: {PG_DEFAULT_DB} (schema {PG_CLAIMS_SCHEMA})")
-            print(f"  • agentic backend database: {PG_AGENTIC_DB}")
+            print(f"  • databases restored: {', '.join(pg_cluster_databases())}")
+            print(f"  • claims backend: {pg_default_db()} (schema {pg_claims_schema()})")
+            print(f"  • agentic backend database: {pg_agentic_db()}")
         return True
 
     err = (result.stderr or "").strip()
@@ -527,12 +526,20 @@ def ensure_containers():
     return True
 
 
-def run_import(backup_zip: Path, extract_dir: Path, *, import_mode: str = "existing") -> int:
-    if import_mode not in DATA_MODES:
-        print(f"ERROR: unknown import mode '{import_mode}' (use: {', '.join(DATA_MODES)})")
+def run_import(
+    backup_zip: Path,
+    extract_dir: Path,
+    *,
+    import_mode: str = "existing",
+    targets: list[str] | None = None,
+) -> int:
+    if import_mode not in config.DATA_MODES:
+        print(f"ERROR: unknown import mode '{import_mode}' (use: {', '.join(config.DATA_MODES)})")
         return 1
 
+    selected = targets or list(config.IMPORT_TARGETS)
     print(f"\nImport mode : {import_mode}")
+    print(f"Targets     : {', '.join(selected)}")
 
     if not ensure_containers():
         return 1
@@ -558,23 +565,32 @@ def run_import(backup_zip: Path, extract_dir: Path, *, import_mode: str = "exist
         return 1
 
     ok = True
-    if sql_file:
-        ok = import_postgres(sql_file, import_mode=import_mode) and ok
+    if "postgres" in selected:
+        if sql_file:
+            ok = import_postgres(sql_file, import_mode=import_mode) and ok
+        else:
+            print("\n[postgres] skipped — no .sql file found")
+            ok = False
     else:
-        print("\n[postgres] skipped — no .sql file found")
-        ok = False
+        print("\n[postgres] skipped — not in --targets")
 
-    if mongo_dir:
-        ok = import_mongo(mongo_dir, import_mode=import_mode) and ok
+    if "mongo" in selected:
+        if mongo_dir:
+            ok = import_mongo(mongo_dir, import_mode=import_mode) and ok
+        else:
+            print("\n[mongo] skipped — no mongodump folder found")
+            ok = False
     else:
-        print("\n[mongo] skipped — no mongodump folder found")
-        ok = False
+        print("\n[mongo] skipped — not in --targets")
 
-    if neo4j_dump:
-        ok = import_neo4j(neo4j_dump, import_mode=import_mode) and ok
+    if "neo4j" in selected:
+        if neo4j_dump:
+            ok = import_neo4j(neo4j_dump, import_mode=import_mode) and ok
+        else:
+            print("\n[neo4j] skipped — no neo4j.dump found")
+            ok = False
     else:
-        print("\n[neo4j] skipped — no neo4j.dump found")
-        ok = False
+        print("\n[neo4j] skipped — not in --targets")
 
     print("\n" + "─" * 60)
     if ok:
@@ -583,7 +599,7 @@ def run_import(backup_zip: Path, extract_dir: Path, *, import_mode: str = "exist
         n_user, _, n_db = neo4j_creds()
         print("Backup import finished successfully.\n")
         print(f"  Postgres  localhost:5432  user={user}")
-        print(f"             agentic db={PG_AGENTIC_DB}  claims db={PG_DEFAULT_DB} (schema {PG_CLAIMS_SCHEMA})")
+        print(f"             agentic db={pg_agentic_db()}  claims db={pg_default_db()} (schema {pg_claims_schema()})")
         print(f"  MongoDB   localhost:27017 user={m_user}  db={m_db}")
         print(f"  Neo4j     bolt://localhost:7687  user={n_user}  db={n_db}")
     else:
@@ -604,16 +620,28 @@ def main():
     )
     parser.add_argument(
         "--import-mode",
-        choices=DATA_MODES,
+        choices=config.DATA_MODES,
         default="existing",
         help="new/existing=full replace from backup; merge=upsert into existing data",
     )
+    parser.add_argument(
+        "--targets",
+        default="all",
+        help="comma list: postgres,mongo,neo4j or all",
+    )
     args = parser.parse_args()
+
+    try:
+        targets = config.parse_target_list(args.targets, allowed=config.IMPORT_TARGETS, label="import target")
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
     return run_import(
         Path(args.backup_zip).expanduser(),
         Path(args.extract_dir),
         import_mode=args.import_mode,
+        targets=targets,
     )
 
 

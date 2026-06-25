@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
 """
-Start UHC application services as local background processes.
+Deploy UHC application repos as local background processes using deployment-ref.txt.
 
-Infra (Postgres, Redis, Neo4j, Mongo, RabbitMQ, Storage) still runs in Docker.
-Apps run directly on the host (Python/Node) with logs in each service folder.
-Database schema and data are restored from backup.zip — deploy does not run migrations.
-
-Deploy order:
-  1. agentic-backend  (pip install, celery worker, django runserver)
-  2. claims-backend   (npm install, npm run dev)
-  3. audit-dashboard  (node serve-dist.mjs)
-  4. claims-frontend  (node serve-dist.mjs)
-  5. mcp-server       (npm install, npm run dev:rest)
-
-Each service stops any previously tracked process (from .deploy-*.pid) before starting.
+Repo .env files are never modified — you manage them manually in each repo folder.
 
 Usage:
-    python deploy-apps.py
-    python deploy-apps.py --recreate   # same as default (stop + restart apps)
-    python deploy-apps.py --skip-mcp
-    python deploy-apps.py --down       # stop all local app processes only
-    python deploy-apps.py --status     # show running PIDs
-
-Stop everything (apps + Docker infra):
-    python master.py --down
+    python deploy-apps.py --deploy all
+    python deploy-apps.py --deploy agentic_backend
+    python deploy-apps.py --stop all
+    python deploy-apps.py --stop mcp_server
+    python deploy-apps.py --status
 """
 
 from __future__ import annotations
@@ -34,25 +20,13 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
-from stack_config import (
-    APP_PORTS,
-    APP_SERVICES,
-    DEV_ENV_ROOT,
-    LOCAL_APP_FOLDERS,
-    SERVICES,
-    claims_database_url,
-)
+import config
+from config import REPO_NAMES, mcp_server_url
+from deploy_ref import DeployStep, background_process_names, parse_deployment_ref
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 IS_WINDOWS = sys.platform.startswith("win")
-
-
-def npm() -> str:
-    return "npm.cmd" if IS_WINDOWS else "npm"
 
 
 def run(cmd, *, cwd=None, env=None, capture=False, check=True):
@@ -79,50 +53,12 @@ def container_running(name: str) -> bool:
 
 
 def ensure_infra_running() -> bool:
-    required = [svc["name"] for svc in SERVICES if not container_running(svc["name"])]
+    required = [svc["name"] for svc in config.services() if not container_running(svc["name"])]
     if required:
         print(f"ERROR: infrastructure containers not running: {', '.join(required)}")
-        print("       Run master.py or resouce-creation-script.py first.")
+        print("       Run: python master.py --infra all --recreate")
         return False
     return True
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    if not path.is_file():
-        return env
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        env[key.strip()] = value
-    return env
-
-
-def merged_env(app: dict) -> dict[str, str]:
-    env = parse_env_file(Path(app["env_file"]))
-    env.update(app.get("env_overrides", {}))
-    if app["name"] == "claims-backend":
-        env["DATABASE_URL"] = claims_database_url()
-    return env
-
-
-def write_env_file(path: Path, env: dict[str, str]):
-    lines = [f"{key}={value}" for key, value in env.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def resolve_service_dir(app_name: str) -> Path | None:
-    candidates = LOCAL_APP_FOLDERS.get(app_name, [app_name])
-    for name in candidates:
-        path = Path(DEV_ENV_ROOT) / name
-        if path.is_dir():
-            return path
-    return None
 
 
 def pid_file(service_dir: Path, process_name: str) -> Path:
@@ -133,11 +69,7 @@ def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        result = run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture=True,
-            check=False,
-        )
+        result = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture=True, check=False)
         return str(pid) in (result.stdout or "")
     try:
         os.kill(pid, 0)
@@ -163,8 +95,8 @@ def stop_pid(pid: int) -> bool:
     return not is_pid_running(pid)
 
 
-def stop_service_processes(service_dir: Path, process_names: list[str]):
-    for name in process_names:
+def stop_repo_processes(repo: str, service_dir: Path):
+    for name in background_process_names(repo):
         pf = pid_file(service_dir, name)
         if not pf.is_file():
             continue
@@ -176,89 +108,72 @@ def stop_service_processes(service_dir: Path, process_names: list[str]):
         if stop_pid(pid):
             print(f"  • stopped {name} (pid {pid})")
         else:
-            print(f"  ! could not stop {name} (pid {pid}) — kill manually")
+            print(f"  ! could not stop {name} (pid {pid})")
         pf.unlink(missing_ok=True)
 
 
-def start_background(
-    service_dir: Path,
-    process_name: str,
-    cmd: list[str],
-    log_name: str,
-    env: dict[str, str] | None = None,
-) -> bool:
+def repo_runtime_env(repo: str) -> dict[str, str]:
+    env = os.environ.copy()
+    if repo == "agentic_backend":
+        env["PYTHONPATH"] = "."
+        env["DJANGO_SETTINGS_MODULE"] = "sop_backend.settings"
+    return env
+
+
+def run_foreground_step(service_dir: Path, step: DeployStep, env: dict[str, str]) -> bool:
+    print(f"  • {step.command} ...")
+    result = subprocess.run(
+        step.command,
+        shell=True,
+        cwd=service_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode == 0:
+        print("  ✓ done")
+        return True
+    err = (result.stderr or result.stdout or "").strip()
+    print(f"  ✗ failed:\n{err}")
+    return False
+
+
+def start_background(service_dir: Path, process_name: str, command: str, log_name: str, env: dict[str, str]) -> bool:
     log_path = service_dir / log_name
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-
-    proc_env = os.environ.copy()
-    if env:
-        proc_env.update(env)
-
     popen_kwargs: dict = {
         "cwd": service_dir,
-        "env": proc_env,
+        "env": env,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
         "stdin": subprocess.DEVNULL,
+        "shell": True,
     }
     if IS_WINDOWS:
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
-
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = subprocess.Popen(command, **popen_kwargs)
     except OSError as exc:
         log_file.close()
         print(f"  ✗ failed to start {process_name}: {exc}")
         return False
-
     pid_file(service_dir, process_name).write_text(str(proc.pid), encoding="utf-8")
     print(f"  ✓ started {process_name} (pid {proc.pid}) → {log_name}")
     return True
 
 
-def run_setup(cmd: list[str], *, cwd: Path, label: str) -> bool:
-    print(f"  • {label} ...")
-    result = run(cmd, cwd=cwd, capture=True, check=False)
-    if result.returncode == 0:
-        print(f"  ✓ {label}")
-        return True
-    err = (result.stderr or result.stdout or "").strip()
-    print(f"  ✗ {label} failed:\n{err}")
-    return False
-
-
-def wait_for_url(url: str, timeout: int = 180) -> bool:
-    print(f"  • waiting for {url} ...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=3) as resp:
-                if 200 <= resp.status < 300:
-                    print("  ✓ ready")
-                    return True
-        except (urllib.error.URLError, TimeoutError, OSError):
-            pass
-        time.sleep(2)
-    print(f"  ✗ not ready after {timeout}s")
-    return False
-
-
-def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: bool) -> bool:
-    """Post-start tasks only — no DB migrations (schema/data come from backup import)."""
-    ok = True
+def run_agentic_automatic_steps(service_dir: Path, env: dict[str, str], *, configure_mcp: bool) -> bool:
     base = [sys.executable]
-    shell_env = agentic_runtime_env(env)
-
-    print("  • skipping Django migrations (database restored from backup dump)")
-
-    print("  • seeding builder catalog ...")
+    print("  • automatic: seed_builder_catalog ...")
     seed = run(
         [*base, "manage.py", "seed_builder_catalog"],
         cwd=service_dir,
-        env=shell_env,
+        env=env,
         capture=True,
         check=False,
     )
@@ -267,16 +182,17 @@ def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: 
     else:
         print("  ✓ builder catalog seeded")
 
-    if skip_mcp:
-        print("  • skipping MCP config (--skip-mcp)")
-        return ok
+    if not configure_mcp:
+        print("  • automatic: skipping MCP config")
+        return True
 
-    print("  • configuring MCP server endpoint in Postgres ...")
+    mcp_url = mcp_server_url()
+    print(f"  • automatic: configuring MCP endpoint ({mcp_url}) in Postgres ...")
     shell_cmd = (
         "from agent_tools.models import McpServerConfig; "
         "McpServerConfig.objects.update_or_create("
         "label='local-mcp-server', "
-        "defaults={'base_url':'http://localhost:3000','auth_header':'x-api-key',"
+        f"defaults={{'base_url':'{mcp_url}','auth_header':'x-api-key',"
         "'api_key':'','http_method':'POST','claim_arg':'claim_number',"
         "'timeout_seconds':30,'is_active':True}); "
         "print('mcp config ok')"
@@ -284,276 +200,107 @@ def run_agentic_post_start(service_dir: Path, env: dict[str, str], *, skip_mcp: 
     mcp = run(
         [*base, "manage.py", "shell", "-c", shell_cmd],
         cwd=service_dir,
-        env=shell_env,
+        env=env,
         capture=True,
         check=False,
     )
     if mcp.returncode != 0:
-        print(f"  ! mcp config warning:\n{(mcp.stderr or '').strip()}")
+        print(f"  ! MCP config warning:\n{(mcp.stderr or '').strip()}")
     else:
         print("  ✓ MCP config saved")
+    return True
+
+
+def deploy_repo(repo: str, steps: list[DeployStep], *, configure_mcp: bool = True) -> bool:
+    try:
+        service_dir = config.repo_path(repo)
+    except ValueError as exc:
+        print(f"  ✗ {exc}")
+        return False
+
+    if not service_dir.is_dir():
+        print(f"  ✗ repo path not found: {service_dir}")
+        return False
+
+    print(f"[{repo}]  ({service_dir})")
+    stop_repo_processes(repo, service_dir)
+    env = repo_runtime_env(repo)
+
+    foreground = [step for step in steps if not step.background]
+    background = [step for step in steps if step.background]
+
+    for step in foreground:
+        if not run_foreground_step(service_dir, step, env):
+            return False
+
+    if repo == "agentic_backend":
+        run_agentic_automatic_steps(service_dir, env, configure_mcp=configure_mcp)
+
+    ok = True
+    for step in background:
+        ok = start_background(service_dir, step.process_name, step.command, step.log_file, env) and ok
     return ok
 
 
-def prepare_service_env(app: dict, service_dir: Path) -> dict[str, str] | None:
-    if app.get("env_managed_locally"):
-        return None
-
-    env = merged_env(app)
-    env_path = Path(app["env_file"])
-    if env:
-        write_env_file(service_dir / ".env", env)
-    elif env_path.is_file():
-        write_env_file(service_dir / ".env", env)
-    elif app.get("env_file_optional"):
-        local_env = service_dir / ".env"
-        if local_env.is_file():
-            print(f"  • using existing {local_env.name} in service folder")
-        else:
-            print(f"  ! optional env file missing: {env_path}")
-    else:
-        write_env_file(service_dir / ".env", env)
-    return env
-
-
-def show_log_tail(service_dir: Path, log_name: str, *, lines: int = 25):
-    log_path = service_dir / log_name
-    if not log_path.is_file():
-        print(f"  ! log file not found: {log_path}")
-        return
-    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
-    if not tail:
-        print(f"  ! log file is empty: {log_path}")
-        return
-    print(f"  ! last lines of {log_name}:")
-    for line in tail:
-        print(f"      {line}")
-
-
-def agentic_runtime_env(env: dict[str, str]) -> dict[str, str]:
-    """Env vars required for Django/Celery on Windows and Unix."""
-    runtime = os.environ.copy()
-    runtime.update(env)
-    runtime["PYTHONPATH"] = "."
-    runtime["DJANGO_SETTINGS_MODULE"] = "sop_backend.settings"
-    return runtime
-
-
-def deploy_agentic(*, recreate: bool, skip_mcp: bool) -> bool:
-    app = next(a for a in APP_SERVICES if a["name"] == "agentic-backend")
-    service_dir = resolve_service_dir("agentic-backend")
-    if service_dir is None:
-        print("  ✗ folder not found: dev-env/agentic-backend")
-        return False
-
-    process_names = ["celery", "django"]
-    stop_service_processes(service_dir, process_names)
-
-    env = prepare_service_env(app, service_dir)
-    if not run_setup(
-        [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
-        cwd=service_dir,
-        label="pip install -r requirements.txt",
-    ):
-        return False
-
-    if not run_agentic_post_start(service_dir, env, skip_mcp=skip_mcp):
-        return False
-
-    runtime_env = agentic_runtime_env(env)
-    celery_cmd = [
-        sys.executable, "-m", "celery", "-A", "sop_backend", "worker",
-        "-Q", "job_queue,celery",
-        "--concurrency=4", "-l", "INFO",
-    ]
-    ok = start_background(service_dir, "celery", celery_cmd, "celery.log", runtime_env)
-    ok = start_background(
-        service_dir,
-        "django",
-        [sys.executable, "manage.py", "runserver", "0.0.0.0:8000"],
-        "agentic-backend.log",
-        runtime_env,
-    ) and ok
-
-    if ok and app.get("health_url"):
-        ok = wait_for_url(app["health_url"])
-    return ok
-
-
-def deploy_claims_backend(*, recreate: bool) -> bool:
-    app = next(a for a in APP_SERVICES if a["name"] == "claims-backend")
-    service_dir = resolve_service_dir("claims-backend")
-    if service_dir is None:
-        print("  ✗ folder not found: dev-env/claims-backend")
-        return False
-
-    stop_service_processes(service_dir, ["nodebackend"])
-
-    env = prepare_service_env(app, service_dir)
-    if not run_setup([npm(), "install"], cwd=service_dir, label="npm install"):
-        return False
-
-    print("  • skipping Prisma migrations (database restored from backup dump)")
-
-    ok = start_background(
-        service_dir,
-        "nodebackend",
-        [npm(), "run", "dev"],
-        "nodebackend.log",
-        env,
-    )
-    if ok and app.get("health_url"):
-        ok = wait_for_url(app["health_url"])
-    return ok
-
-
-def deploy_node_static(app_name: str, *, script: str, process_name: str, log_name: str, recreate: bool) -> bool:
-    app = next(a for a in APP_SERVICES if a["name"] == app_name)
-    service_dir = resolve_service_dir(app_name)
-    if service_dir is None:
-        print(f"  ✗ folder not found for {app_name} under dev-env/")
-        return False
-
-    stop_service_processes(service_dir, [process_name])
-
-    env = prepare_service_env(app, service_dir)
-    script_path = service_dir / script
-    if not script_path.is_file():
-        print(f"  ✗ script not found: {script_path}")
-        return False
-
-    ok = start_background(
-        service_dir,
-        process_name,
-        ["node", script],
-        log_name,
-        env,
-    )
-    if ok and app.get("health_url"):
-        ok = wait_for_url(app["health_url"])
-    return ok
-
-
-def deploy_mcp(*, recreate: bool) -> bool:
-    app = next(a for a in APP_SERVICES if a["name"] == "mcp-server")
-    service_dir = resolve_service_dir("mcp-server")
-    if service_dir is None:
-        print("  ✗ folder not found: dev-env/claims-tools-mcp-server")
-        return False
-
-    stop_service_processes(service_dir, ["mcp"])
-
-    local_env = service_dir / ".env"
-    if local_env.is_file():
-        print(f"  • using {local_env.name} (managed manually — deploy does not modify it)")
-    else:
-        print(f"  ! create {local_env} with required MCP variables before starting")
-
-    if not run_setup([npm(), "install"], cwd=service_dir, label="npm install"):
-        return False
-
-    ok = start_background(
-        service_dir,
-        "mcp",
-        [npm(), "run", "dev:rest"],
-        "mcp-server.log",
-        None,
-    )
-    if ok and app.get("health_url"):
-        ok = wait_for_url(app["health_url"], timeout=300)
-        if not ok:
-            pf = pid_file(service_dir, "mcp")
-            pid_alive = False
-            if pf.is_file():
-                try:
-                    pid_alive = is_pid_running(int(pf.read_text(encoding="utf-8").strip()))
-                except ValueError:
-                    pass
-            show_log_tail(service_dir, "mcp-server.log")
-            if pid_alive:
-                print("  ! MCP process is running but /health did not respond — check mcp-server.log")
-            else:
-                print("  ✗ MCP process exited — see mcp-server.log above")
-    return ok
-
-
-def deploy_apps(*, recreate: bool = False, skip_mcp: bool = False) -> int:
+def deploy_repos(repos: list[str], *, configure_mcp: bool = True) -> int:
     if not ensure_infra_running():
         return 1
 
-    print("\nDeploying application services (local processes) ...")
-    print("(no DB migrations — schema and data come from backup import)\n")
-    if skip_mcp:
-        print("(MCP server will be skipped)\n")
+    try:
+        ref = parse_deployment_ref()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
-    ok = True
+    print("\nDeploying repositories from deployment-ref.txt ...\n")
+    failures: list[str] = []
+    for repo in repos:
+        ok = deploy_repo(repo, ref[repo], configure_mcp=configure_mcp)
+        if not ok:
+            failures.append(repo)
+            print(f"  ! fix {repo} and re-run: python master.py --deploy {repo}")
+        print()
 
-    print("[agentic-backend]")
-    ok = deploy_agentic(recreate=recreate, skip_mcp=skip_mcp) and ok
+    if failures:
+        print("Deployment finished with errors:")
+        for repo in failures:
+            print(f"  ✗ {repo}")
+        return 1
 
-    print("\n[claims-backend]")
-    ok = deploy_claims_backend(recreate=recreate) and ok
-
-    print("\n[audit-dashboard]")
-    ok = deploy_node_static(
-        "audit-dashboard",
-        script="serve-dist.mjs",
-        process_name="audit",
-        log_name="audit-dashboard.log",
-        recreate=recreate,
-    ) and ok
-
-    print("\n[claims-frontend]")
-    ok = deploy_node_static(
-        "claims-frontend",
-        script="serve-dist.mjs",
-        process_name="frontend",
-        log_name="claims-frontend.log",
-        recreate=recreate,
-    ) and ok
-
-    if not skip_mcp:
-        print("\n[mcp-server]")
-        ok = deploy_mcp(recreate=recreate) and ok
-
-    print_summary(ok, skip_mcp=skip_mcp)
-    return 0 if ok else 1
+    print("Deployment finished successfully.")
+    return 0
 
 
-def cmd_down():
-    print("Stopping local application processes ...")
-    stops = [
-        ("agentic-backend", ["celery", "django"]),
-        ("claims-backend", ["nodebackend"]),
-        ("audit-dashboard", ["audit"]),
-        ("claims-frontend", ["frontend"]),
-        ("mcp-server", ["mcp"]),
-    ]
-    for app_name, processes in stops:
-        service_dir = resolve_service_dir(app_name)
-        if service_dir is None:
+def stop_repos(repos: list[str]) -> int:
+    print("Stopping repository processes ...\n")
+    for repo in repos:
+        try:
+            service_dir = config.repo_path(repo)
+        except ValueError as exc:
+            print(f"[{repo}]  ✗ {exc}")
             continue
-        print(f"[{app_name}]")
-        stop_service_processes(service_dir, processes)
-    print("\nDone. Local application processes stopped.")
+        if not service_dir.is_dir():
+            print(f"[{repo}]  ✗ path not found: {service_dir}")
+            continue
+        print(f"[{repo}]")
+        stop_repo_processes(repo, service_dir)
+    print("\nDone.")
+    return 0
 
 
 def cmd_status():
-    print("Local application process status:\n")
-    checks = [
-        ("agentic-backend", ["celery", "django"]),
-        ("claims-backend", ["nodebackend"]),
-        ("audit-dashboard", ["audit"]),
-        ("claims-frontend", ["frontend"]),
-        ("mcp-server", ["mcp"]),
-    ]
-    for app_name, processes in checks:
-        service_dir = resolve_service_dir(app_name)
-        if service_dir is None:
-            print(f"  {app_name:18} — folder not found")
+    print("Repository process status:\n")
+    for repo in REPO_NAMES:
+        try:
+            service_dir = config.repo_path(repo)
+        except ValueError as exc:
+            print(f"  {repo:30} — {exc}")
+            continue
+        if not service_dir.is_dir():
+            print(f"  {repo:30} — path not found")
             continue
         parts = []
-        for proc in processes:
+        for proc in background_process_names(repo):
             pf = pid_file(service_dir, proc)
             if pf.is_file():
                 try:
@@ -564,54 +311,36 @@ def cmd_status():
                     parts.append(f"{proc}=unknown")
             else:
                 parts.append(f"{proc}=not started")
-        print(f"  {app_name:18} {', '.join(parts)}")
-
-
-def print_summary(ok: bool, *, skip_mcp: bool = False):
-    print("\n" + "─" * 60)
-    if ok:
-        print("Applications started (local processes).\n")
-        print(f"  Agentic backend   http://localhost:{APP_PORTS['agentic-backend']}/api/ingest/health/")
-        print(f"    logs            dev-env/agentic-backend/agentic-backend.log, celery.log")
-        print(f"  Claims backend    http://localhost:{APP_PORTS['claims-backend']}/health")
-        print(f"    logs            dev-env/claims-backend/nodebackend.log")
-        print(f"  Claims frontend   http://localhost:{APP_PORTS['claims-frontend']}/")
-        print(f"    logs            dev-env/claims-frontend/claims-frontend.log")
-        print(f"  Audit dashboard   http://localhost:{APP_PORTS['audit-dashboard']}/")
-        print(f"    logs            dev-env/audit-review-dashboard/audit-dashboard.log")
-        if skip_mcp:
-            print("  MCP server        (skipped)")
-        else:
-            print(f"  MCP server        http://localhost:{APP_PORTS['mcp-server']}/health")
-            print(f"    logs            dev-env/claims-tools-mcp-server/mcp-server.log")
-        print("\nUseful:")
-        print("  python deploy-apps.py --status")
-        print("  python deploy-apps.py --down")
-    else:
-        print("Application deployment finished with errors.")
-    print("─" * 60)
+        print(f"  {repo:30} {', '.join(parts)}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Deploy UHC applications as local processes.")
-    parser.add_argument("--skip-mcp", action="store_true",
-                        help="skip MCP server")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--recreate", action="store_true",
-                       help="stop and restart application processes (default behavior)")
-    group.add_argument("--down", action="store_true",
-                       help="stop local application processes")
-    group.add_argument("--status", action="store_true",
-                       help="show local process status")
+    parser = argparse.ArgumentParser(description="Deploy UHC repos from deployment-ref.txt")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--deploy", metavar="REPO", help="repo name or all")
+    group.add_argument("--stop", metavar="REPO", help="repo name or all")
+    group.add_argument("--status", action="store_true", help="show process status")
+    parser.add_argument("--skip-mcp-config", action="store_true",
+                        help="skip automatic MCP config step for agentic_backend")
     args = parser.parse_args()
 
-    if args.down:
-        cmd_down()
-        return 0
     if args.status:
         cmd_status()
         return 0
-    return deploy_apps(recreate=args.recreate, skip_mcp=args.skip_mcp)
+
+    try:
+        repos = config.parse_target_list(
+            args.deploy if args.deploy else args.stop,
+            allowed=REPO_NAMES,
+            label="repo",
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    if args.stop:
+        return stop_repos(repos)
+    return deploy_repos(repos, configure_mcp=not args.skip_mcp_config)
 
 
 if __name__ == "__main__":

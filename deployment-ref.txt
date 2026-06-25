@@ -1,0 +1,22 @@
+# Deployment steps per repo. Edit and re-run: python master.py --deploy <repo_name>
+# Background steps: append  | background | log=<file> | process=<name>
+# Foreground steps run first and must succeed before background steps start.
+
+[agentic_backend]
+step1: python -m pip install -r requirements.txt
+step2: python -m celery -A sop_backend worker -Q job_queue,celery --concurrency=4 -l INFO | background | log=celery.log | process=celery
+step3: python manage.py runserver 0.0.0.0:8000 | background | log=agentic-backend.log | process=django
+
+[claims_backend]
+step1: npm install
+step2: npm run dev | background | log=nodebackend.log | process=nodebackend
+
+[audit_review_dashboard_hitl]
+step1: node serve-dist.mjs | background | log=audit-dashboard.log | process=audit
+
+[claims_frontend_dashboard]
+step1: node serve-dist.mjs | background | log=claims-frontend.log | process=frontend
+
+[mcp_server]
+step1: npm install
+step2: npm run dev:rest | background | log=mcp-server.log | process=mcp

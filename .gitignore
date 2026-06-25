@@ -2,6 +2,7 @@ env-details/
 dev-env/
 storage-account/
 .env
+!.env.example
 backup.zip
 *.sql
 all_databases_backup.sql

@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-Spin up Postgres, Redis, Neo4j, MongoDB, RabbitMQ, and the storage file server as Docker containers.
-
-Works on macOS, Windows and Linux as long as Docker (Docker Desktop) is
-installed and the daemon is running.
+Spin up Postgres, Redis, Neo4j, MongoDB, RabbitMQ, and storage as Docker containers.
 
 Usage:
-    python setup_stack.py            # create + start everything
-    python setup_stack.py --recreate              # recreate containers (keep volumes)
-    python setup_stack.py --recreate --volume-mode new      # wipe volumes, fresh start
-    python setup_stack.py --recreate --volume-mode existing # keep volumes (default)
-    python setup_stack.py --down     # stop & remove containers (data dirs kept)
-    python setup_stack.py --status   # show what's running
-
-Everything you need to edit (passwords + volume paths) is in stack_config.py.
+    python resouce-creation-script.py --recreate
+    python resouce-creation-script.py --recreate --services postgres,mongo
+    python resouce-creation-script.py --recreate --services all --volume-mode new
+    python resouce-creation-script.py --down --services postgres
+    python resouce-creation-script.py --status
 """
 
 import argparse
@@ -23,23 +17,12 @@ import shutil
 import subprocess
 import sys
 
-from stack_config import (
-    DATA_MODES,
-    DATA_ROOT,
-    NETWORK_NAME,
-    SERVICES,
-    STORAGE_PORT,
-    STORAGE_URL,
-    USE_NAMED_VOLUMES,
-    stack_volume_name,
-)
+import config
 
 IS_WINDOWS = platform.system() == "Windows"
 
 
-# ─────────────────────────── small helpers ───────────────────────────
 def run(cmd, capture=False, check=True):
-    """Run a command. Returns CompletedProcess. cmd is a list of args."""
     return subprocess.run(
         cmd,
         check=check,
@@ -50,117 +33,83 @@ def run(cmd, capture=False, check=True):
 
 
 def out(cmd):
-    """Run and return stripped stdout (empty string on failure)."""
     r = run(cmd, capture=True, check=False)
     return (r.stdout or "").strip()
 
 
 def docker_ready():
-    """Check docker is installed and the daemon is up."""
-    if subprocess.run(["docker", "--version"],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run(["docker", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         print("ERROR: Docker CLI not found. Install Docker Desktop and try again.")
         return False
-    if subprocess.run(["docker", "info"],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         print("ERROR: Docker is installed but the daemon isn't running.")
-        print("       Start Docker Desktop, wait until it says 'running', then re-run.")
         return False
     return True
 
 
 def ensure_network():
     existing = out(["docker", "network", "ls", "--format", "{{.Name}}"]).splitlines()
-    if NETWORK_NAME not in existing:
-        run(["docker", "network", "create", NETWORK_NAME])
-        print(f"  • created network '{NETWORK_NAME}'")
+    if config.network_name() not in existing:
+        run(["docker", "network", "create", config.network_name()])
+        print(f"  • created network '{config.network_name()}'")
 
 
 def container_exists(name):
-    names = out(["docker", "ps", "-a", "--format", "{{.Names}}"]).splitlines()
-    return name in names
+    return name in out(["docker", "ps", "-a", "--format", "{{.Names}}"]).splitlines()
 
 
 def container_running(name):
-    names = out(["docker", "ps", "--format", "{{.Names}}"]).splitlines()
-    return name in names
+    return name in out(["docker", "ps", "--format", "{{.Names}}"]).splitlines()
 
 
 def host_path(service):
-    # Use the explicit "host_path" set per service; fall back to DATA_ROOT/<name>.
-    p = service.get("host_path") or os.path.join(DATA_ROOT, service["name"])
-    return os.path.abspath(p)
+    return os.path.abspath(service.get("host_path") or os.path.join(config.data_root(), service["name"]))
 
 
 def format_bind_source(path):
-    """Return a host path Docker/Podman can bind-mount on this OS."""
     path = os.path.abspath(path)
     if IS_WINDOWS:
-        # C:\foo\bar breaks `-v host:container` because the drive-letter colon is
-        # treated as the mount delimiter. Forward slashes fix this on Windows.
         return path.replace("\\", "/")
     return path
 
 
 def docker_context_path(path):
-    """Normalize a filesystem path for docker build/run arguments."""
     return format_bind_source(path) if IS_WINDOWS else os.path.abspath(path)
 
 
 def ensure_dir_with_perms(path):
-    """Create the host dir and make sure the container can write to it.
-
-    Returns True if usable, False if the user must fix permissions manually.
-    """
     try:
         os.makedirs(path, exist_ok=True)
     except PermissionError:
         print(f"  ! cannot create {path} (permission denied).")
-        print(f"    Create it yourself or pick a DATA_ROOT you own, then re-run.")
         return False
-
-    # On macOS/Linux, container processes often run as a non-root uid and need
-    # write access to the bind-mounted folder. Open it up for local dev use.
     if not IS_WINDOWS:
         try:
             os.chmod(path, 0o777)
         except PermissionError:
-            pass  # fall through to the writability check below
-
+            pass
     if not os.access(path, os.W_OK):
-        print(f"  ! {path} is not writable by you.")
-        if not IS_WINDOWS:
-            print(f"    Fix with:  sudo chown -R $(id -u):$(id -g) '{path}'")
+        print(f"  ! {path} is not writable.")
         return False
     return True
 
 
 def add_volume_mount(cmd, service):
-    """Append a volume mount to a docker run command.
-
-    Returns False if a host directory could not be prepared.
-    """
-    if USE_NAMED_VOLUMES:
-        cmd += ["-v", f"{stack_volume_name(service['name'])}:{service['volume']}"]
+    if config.use_named_volumes():
+        cmd += ["-v", f"{config.stack_volume_name(service['name'])}:{service['volume']}"]
         return True
-
     hp = host_path(service)
     if not ensure_dir_with_perms(hp):
         return False
-
     source = format_bind_source(hp)
     target = service["volume"]
     if IS_WINDOWS:
-        # Avoid `-v C:/host:/container` parsing issues on Windows/Podman.
         cmd += ["--mount", f"type=bind,source={source},target={target}"]
     else:
         cmd += ["-v", f"{source}:{target}"]
     return True
 
 
-# ─────────────────────────── actions ───────────────────────────
 def pull(image):
     print(f"  • pulling {image} ...")
     run(["docker", "pull", image])
@@ -171,7 +120,6 @@ def image_exists(image):
 
 
 def local_image_ref(image):
-    """Return a local image reference docker run can use without pulling."""
     image_id = out(["docker", "images", "-q", image])
     if image_id:
         return image_id.splitlines()[0]
@@ -184,39 +132,28 @@ def build_image(service, force=False):
     if not context:
         pull(image)
         return True
-
     context = docker_context_path(context)
     if not os.path.isdir(context):
         print(f"  ✗ build context not found for '{service['name']}': {context}")
         return False
-
     if force or not image_exists(image):
         print(f"  • building {image} from {context} ...")
-        build_cmd = ["docker", "build", "-t", image, context]
-        result = run(build_cmd, capture=True, check=False)
+        result = run(["docker", "build", "-t", image, context], capture=True, check=False)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             print(f"  ✗ failed to build '{service['name']}':\n    {detail}")
             return False
-
         if not image_exists(image):
-            # buildx builders may need --load to make the image visible locally.
-            print(f"  • image not visible yet — retrying with docker build --load ...")
-            load_cmd = ["docker", "build", "--load", "-t", image, context]
-            result = run(load_cmd, capture=True, check=False)
+            result = run(["docker", "build", "--load", "-t", image, context], capture=True, check=False)
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
                 print(f"  ✗ failed to load '{service['name']}' image:\n    {detail}")
                 return False
-
         if not image_exists(image):
-            print(f"  ✗ build finished but image '{image}' is not in local docker images.")
-            print(f"    Try manually: docker build -t {image} {context}")
+            print(f"  ✗ build finished but image '{image}' is not available locally.")
             return False
-
         print(f"  ✓ built {image}")
         return True
-
     print(f"  • image '{image}' already exists — skipping build")
     return True
 
@@ -225,9 +162,26 @@ def remove(name):
     run(["docker", "rm", "-f", name], capture=True, check=False)
 
 
+def remove_service_volumes(service_names: list[str]):
+    print("\nRemoving data for selected services ...")
+    all_services = {svc["name"]: svc for svc in config.services()}
+    for name in service_names:
+        svc = all_services.get(name)
+        if not svc:
+            continue
+        if config.use_named_volumes():
+            vol = config.stack_volume_name(name)
+            print(f"  • removing volume '{vol}' ...")
+            run(["docker", "volume", "rm", "-f", vol], check=False)
+        else:
+            hp = host_path(svc)
+            if os.path.isdir(hp):
+                print(f"  • removing data dir '{hp}' ...")
+                shutil.rmtree(hp, ignore_errors=True)
+
+
 def create_service(service, recreate):
     name = service["name"]
-
     if container_exists(name):
         if recreate:
             print(f"  • removing existing '{name}' ...")
@@ -252,10 +206,9 @@ def create_service(service, recreate):
         "docker", "run", "-d",
         "--name", name,
         "--restart", "unless-stopped",
-        "--network", NETWORK_NAME,
+        "--network", config.network_name(),
     ]
     if service.get("build"):
-        # Local-only tags like uhc-storage-account:local must not be pulled from Docker Hub.
         cmd += ["--pull=never"]
     for host_port, cont_port in service["ports"].items():
         cmd += ["-p", f"{host_port}:{cont_port}"]
@@ -276,106 +229,96 @@ def create_service(service, recreate):
     return False
 
 
-def remove_all_data_volumes():
-    """Delete every stack data volume or bind-mount folder."""
-    print("\nRemoving all stack data volumes ...")
-    for svc in SERVICES:
-        if USE_NAMED_VOLUMES:
-            vol = stack_volume_name(svc["name"])
-            print(f"  • removing volume '{vol}' ...")
-            run(["docker", "volume", "rm", "-f", vol], check=False)
-        else:
-            hp = host_path(svc)
-            if os.path.isdir(hp):
-                print(f"  • removing data dir '{hp}' ...")
-                shutil.rmtree(hp, ignore_errors=True)
-
-
-def cmd_up(recreate, volume_mode="existing"):
-    storage = "Docker named volumes" if USE_NAMED_VOLUMES else DATA_ROOT
-    print(f"\nData mode   : {storage}")
-    print(f"Volume mode : {volume_mode}")
-    print(f"Platform    : {platform.system()}\n")
+def cmd_up(recreate, volume_mode, service_names):
+    storage = "Docker named volumes" if config.use_named_volumes() else config.data_root()
+    print(f"\nData mode    : {storage}")
+    print(f"Volume mode  : {volume_mode}")
+    print(f"Services     : {', '.join(service_names)}")
+    print(f"Platform     : {platform.system()}\n")
 
     if volume_mode == "new":
-        cmd_down()
-        remove_all_data_volumes()
+        for svc in config.services():
+            if container_exists(svc["name"]) and svc["name"] in service_names:
+                print(f"  • removing container '{svc['name']}' before volume wipe ...")
+                remove(svc["name"])
+        remove_service_volumes(service_names)
         recreate = True
-    elif volume_mode not in DATA_MODES:
-        print(f"ERROR: unknown volume mode '{volume_mode}' (use: {', '.join(DATA_MODES)})")
-        return 1
 
     ensure_network()
     ok = True
-    for svc in SERVICES:
+    for svc in config.services():
+        if svc["name"] not in service_names:
+            continue
         print(f"[{svc['name']}]")
         if not create_service(svc, recreate):
             ok = False
     if ok:
         print_summary()
     else:
-        print("\nSome services failed to start. Check the errors above, then re-run with --recreate.")
+        print("\nSome services failed. Fix errors above and re-run the failed service only.")
     return 0 if ok else 1
 
 
-def cmd_down():
-    for svc in SERVICES:
-        if container_exists(svc["name"]):
+def cmd_down(service_names):
+    for svc in config.services():
+        if svc["name"] in service_names and container_exists(svc["name"]):
             print(f"  • removing '{svc['name']}'")
             remove(svc["name"])
-    print("\nDone. Data folders/volumes were left untouched.")
+    print("\nDone. Data volumes/folders were left untouched.")
 
 
 def cmd_status():
-    run(["docker", "ps", "--filter", f"network={NETWORK_NAME}",
-         "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}"], check=False)
+    run(
+        ["docker", "ps", "--filter", f"network={config.network_name()}",
+         "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}"],
+        check=False,
+    )
 
 
 def print_summary():
+    port = config.get_int("STORAGE_PORT", 8080)
+    storage_url = config.storage_url()
     print("\n" + "─" * 60)
     print("Stack is up. Connect from your host using 'localhost':\n")
-    print("  Postgres   localhost:5432   user=postgres  db=postgres")
-    print("  Redis      localhost:6379   (auth via requirepass)")
+    print("  Postgres   localhost:5432")
+    print("  Redis      localhost:6379")
     print("  Neo4j      bolt://localhost:7687   browser http://localhost:7474")
-    print("  MongoDB    localhost:27017  user=admin  authdb=admin")
+    print("  MongoDB    localhost:27017")
     print("  RabbitMQ   localhost:5672   UI http://localhost:15672")
-    print(f"  Storage    {STORAGE_URL}  UI login {STORAGE_URL}login")
-    print(f"               API {STORAGE_URL}api/storage")
+    print(f"  Storage    {storage_url}")
     print("\nUseful:")
-    print("  docker ps                 # see containers")
-    print("  docker logs -f postgres   # follow a container's logs")
-    print("  python master.py --down        # tear it all down")
+    print("  docker ps")
+    print("  python master.py --status")
+    print("  python master.py --down")
     print("─" * 60)
-    print("Note: RabbitMQ's 'guest' user only connects from localhost by")
-    print("design. If you need remote access, change RABBITMQ_DEFAULT_USER.")
 
 
 def main():
     p = argparse.ArgumentParser(description="Create local DB/queue Docker containers.")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--recreate", action="store_true",
-                   help="remove & recreate containers (data kept)")
-    g.add_argument("--down", action="store_true",
-                   help="stop & remove containers (data kept)")
+    g.add_argument("--recreate", action="store_true", help="remove & recreate selected containers")
+    g.add_argument("--down", action="store_true", help="stop & remove selected containers")
     g.add_argument("--status", action="store_true", help="show running containers")
-    p.add_argument(
-        "--volume-mode",
-        choices=DATA_MODES,
-        default="existing",
-        help="new=wipe volumes then create; existing=keep volumes; merge=keep volumes",
-    )
+    p.add_argument("--services", default="all", help="comma list or all (default: all)")
+    p.add_argument("--volume-mode", choices=config.DATA_MODES, default="existing",
+                   help="new=wipe selected volumes; existing/merge=keep volumes")
     args = p.parse_args()
 
     if not docker_ready():
         sys.exit(1)
 
+    try:
+        service_names = config.parse_target_list(args.services, allowed=config.INFRA_SERVICES, label="service")
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
     if args.down:
-        cmd_down()
+        cmd_down(service_names)
     elif args.status:
         cmd_status()
     else:
-        sys.exit(cmd_up(recreate=args.recreate, volume_mode=args.volume_mode))
-
+        sys.exit(cmd_up(args.recreate, args.volume_mode, service_names))
 
 
 if __name__ == "__main__":
